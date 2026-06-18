@@ -21,6 +21,10 @@ export interface HookMatcher {
   tool?: string;
   /** Regex pattern to match against the serialized tool input */
   pattern?: string;
+  /** For post_tool_use hooks: only fire when the tool result was an error
+   *  (isError === true). Lets users condition "on failure, inject retry hint"
+   *  instead of firing on every tool_result. */
+  resultIsError?: boolean;
 }
 
 export interface HookDefinition {
@@ -82,8 +86,14 @@ export function loadHooksConfig(cwd: string): HooksConfig {
 
 // ── Hook matching ───────────────────────────────────────────────────────────
 
+/** Optional tool-result context passed to matchHooks for post_tool_use
+ *  matching (e.g. isError). Undefined for pre_tool_use (no result yet). */
+export interface HookMatchResult {
+  isError?: boolean;
+}
+
 /**
- * Filter hooks that match the given event and optional tool name/input.
+ * Filter hooks that match the given event and optional tool name/input/result.
  * A hook must match both the event AND the optional matcher (if present).
  */
 export function matchHooks(
@@ -91,6 +101,7 @@ export function matchHooks(
   event: HookEvent,
   toolName?: string,
   input?: Record<string, unknown>,
+  result?: HookMatchResult,
 ): HookDefinition[] {
   const inputStr = JSON.stringify(input ?? {});
   return hooks.filter((h) => {
@@ -112,6 +123,10 @@ export function matchHooks(
           return false;
         }
       }
+
+      // Result-error filter (post_tool_use only): only fire when the tool
+      // result was an error. result.isError is undefined for pre_tool_use.
+      if (matcher.resultIsError === true && !result?.isError) return false;
     }
 
     return true;
@@ -356,7 +371,9 @@ export default function (pi: ExtensionAPI) {
     const toolName = event.toolName;
     const input = event.input;
 
-    const matched = matchHooks(config.hooks, "post_tool_use", toolName, input);
+    const matched = matchHooks(config.hooks, "post_tool_use", toolName, input, {
+      isError: event.isError,
+    });
     const { injectMessages } = await executeHooks(matched, pi, ctx, { toolName, input });
 
     // Inject feedback messages (e.g., exec failures with onFailure: "inject")

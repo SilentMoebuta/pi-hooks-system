@@ -5,12 +5,10 @@ Standardized event hooks for Pi Agent. Configure hooks as JSON rules instead of 
 ## Installation
 
 ```bash
-# Copy to project extensions
-cp -r extensions/pi-hooks-system .pi/extensions/
-
-# Or load directly
-pi -e extensions/pi-hooks-system/index.ts
+pi install git:github.com/SilentMoebuta/pi-hooks-system
 ```
+
+> 旧的手动复制(`cp -r`)与 `pi -e` 加载方式已废弃，请使用上面的包安装。
 
 ## Quick Start
 
@@ -35,6 +33,7 @@ Each hook has:
 - `matcher` (optional): filter by tool name or regex pattern
   - `tool`: match specific tool (e.g., `"bash"`, `"edit"`, `"write"`)
   - `pattern`: regex to match against tool parameters
+  - `resultIsError` (post_tool_use only): only fire when the tool result was an error — useful for "on failure, inject a retry hint" without firing on every successful result
 - `message`, `injectPrompt`, `command`, `onFailure`: action-specific fields
 
 ### Available Events
@@ -44,7 +43,7 @@ Each hook has:
 | `pre_tool_use` | Before any tool executes | Block dangerous operations, modify parameters |
 | `post_tool_use` | After tool execution completes | Auto lint, format, test |
 | `agent_end` | Agent finishes a turn / wants to stop | Inject verification checklist before completion |
-| `session_start` | Session initialization | Load project context, coding standards |
+| `session_start` | Session initialization | Load project context, coding standards. **Note:** `inject` actions on `session_start` are delivered as `steer` messages; if there is no active turn yet they may take effect on the first user turn rather than immediately. |
 
 ### Available Actions
 

@@ -225,3 +225,43 @@ describe("agent_end event matching", () => {
     assert.deepStrictEqual(injects, ["check tests", "check lint"]);
   });
 });
+
+describe("post_tool_use resultIsError matching", () => {
+  it("fires hook when resultIsError=true and tool errored", () => {
+    const hooks: HookDefinition[] = [{
+      event: "post_tool_use", action: "inject",
+      matcher: { tool: "bash", resultIsError: true },
+      injectPrompt: "bash failed — check stderr",
+    }];
+    const matched = matchHooks(hooks, "post_tool_use", "bash", { command: "x" }, { isError: true });
+    assert.equal(matched.length, 1);
+  });
+
+  it("skips hook when resultIsError=true but tool succeeded", () => {
+    const hooks: HookDefinition[] = [{
+      event: "post_tool_use", action: "inject",
+      matcher: { resultIsError: true },
+      injectPrompt: "should not fire",
+    }];
+    assert.equal(matchHooks(hooks, "post_tool_use", "bash", {}, { isError: false }).length, 0);
+  });
+
+  it("fires hook without resultIsError matcher regardless of error state (back-compat)", () => {
+    const hooks: HookDefinition[] = [{
+      event: "post_tool_use", action: "warn", message: "any result",
+    }];
+    assert.equal(matchHooks(hooks, "post_tool_use", "bash", {}, { isError: true }).length, 1);
+    assert.equal(matchHooks(hooks, "post_tool_use", "bash", {}, { isError: false }).length, 1);
+    assert.equal(matchHooks(hooks, "post_tool_use", "bash", {}).length, 1);
+  });
+
+  it("resultIsError has no effect on pre_tool_use (no result yet)", () => {
+    const hooks: HookDefinition[] = [{
+      event: "pre_tool_use", action: "warn",
+      matcher: { resultIsError: true },
+      message: "x",
+    }];
+    // pre_tool_use: result is undefined; resultIsError=true && !result?.isError → filtered out
+    assert.equal(matchHooks(hooks, "pre_tool_use", "bash", {}).length, 0);
+  });
+});
