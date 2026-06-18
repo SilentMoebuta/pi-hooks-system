@@ -1,0 +1,36 @@
+{
+  "name": "pi-hooks-system",
+  "version": "1.0.0",
+  "description": "Configuration-driven event hooks for pi agent — configure hooks as JSON rules (pre_tool_use/post_tool_use/agent_end/session_start) instead of writing TypeScript extensions.",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "hooks",
+    "event-hooks",
+    "automation"
+  ],
+  "license": "MIT",
+  "author": "SilentMoebuta",
+  "files": [
+    "index.ts",
+    "__tests__",
+    "README.md",
+    "LICENSE",
+    "hooks.example.json"
+  ],
+  "pi": {
+    "extensions": [
+      "./"
+    ]
+  },
+  "scripts": {
+    "test": "tsx --test __tests__/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.3",
+    "tsx": "^4.0.0",
+    "typescript": "^6.0.3"
+  }
+}

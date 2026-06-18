@@ -1,0 +1,36 @@
+{
+  "hooks": [
+    {
+      "event": "pre_tool_use",
+      "matcher": { "tool": "bash", "pattern": "rm -rf" },
+      "action": "block",
+      "message": "Dangerous command detected: rm -rf. This will permanently delete files."
+    },
+    {
+      "event": "post_tool_use",
+      "matcher": { "tool": "edit" },
+      "action": "exec",
+      "command": "npx prettier --check ${EDIT_FILE} 2>&1 || true",
+      "onFailure": "inject",
+      "message": "Format check failed:"
+    },
+    {
+      "event": "post_tool_use",
+      "matcher": { "tool": "write" },
+      "action": "exec",
+      "command": "npx eslint ${FILES} 2>&1",
+      "onFailure": "inject",
+      "message": "Lint check failed:"
+    },
+    {
+      "event": "agent_end",
+      "action": "inject",
+      "injectPrompt": "Before concluding, verify:\n1. All tests pass (npm test)\n2. No lint errors (npm run lint)\n3. Changes are committed (git status)"
+    },
+    {
+      "event": "session_start",
+      "action": "inject",
+      "injectPrompt": "Project rules:\n- Use TDD: write failing test first, then implementation\n- Follow TypeScript strict mode\n- Commit small, focused changes"
+    }
+  ]
+}
