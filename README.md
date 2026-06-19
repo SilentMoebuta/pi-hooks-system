@@ -1,6 +1,18 @@
 # pi-hooks-system
 
-Standardized event hooks for Pi Agent. Configure hooks as JSON rules instead of writing TypeScript extensions.
+Standardized **stateless** event hooks for Pi Agent. Configure hooks as JSON rules instead of writing TypeScript extensions.
+
+## When to use this vs sibling packages
+
+This is one of three hook-style extensions; they cover different capability tiers — pick by what your hook needs:
+
+| Need | Use |
+|---|---|
+| Stateless declarative rule ("when tool X matches pattern Y, block/warn/inject/exec") | **pi-hooks-system** (this package) |
+| Multi-step pipeline with retry state after edits (format→typecheck→lint→test) | pi-auto-fix-loop |
+| Cross-turn cumulative condition with cooldown ("5 turns since last test → remind") | pi-event-reminders |
+
+**Do not try to express stateful pipelines or cumulative conditions here.** This package matches an event once and fires a single action; it has no per-session state, no multi-step ordering, no cooldown. If your rule needs to count, accumulate, or retry, it belongs in one of the siblings above.
 
 ## Installation
 
