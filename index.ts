@@ -182,7 +182,7 @@ export function renderCommandTemplate(
  * Execute matched hooks in order.
  * block and exec actions are async; warn and inject are synchronous.
  */
-async function executeHooks(
+export async function executeHooks(
   matched: HookDefinition[],
   pi: ExtensionAPI,
   ctx: ExtensionContext,
@@ -201,8 +201,13 @@ async function executeHooks(
           );
           if (!confirmed) blocked = true;
         } else {
-          // Non-interactive mode: block automatically
+          // Non-interactive mode: block automatically. Always notify the
+          // reason so the user/agent doesn't see an opaque tool failure.
           blocked = true;
+          ctx.ui.notify(
+            hook.message || "Blocked by hooks-system pre_tool_use hook",
+            "warning",
+          );
         }
         break;
       }
@@ -221,6 +226,20 @@ async function executeHooks(
 
       case "exec": {
         if (blocked) break; // Don't run side-effect commands on a blocked action
+        // Trust gate: never render + sh -c arbitrary shell from an untrusted
+        // project's hooks.json. A cloned malicious repo could otherwise run
+        // shell on the first matching tool call.
+        const trusted =
+          typeof (ctx as unknown as { isProjectTrusted?: () => boolean }).isProjectTrusted === "function"
+            ? (ctx as unknown as { isProjectTrusted: () => boolean }).isProjectTrusted()
+            : true;
+        if (!trusted) {
+          ctx.ui.notify(
+            "hooks-system: exec hook skipped (project not trusted)",
+            "warning",
+          );
+          break;
+        }
         if (hook.command) {
           try {
             const variables = buildHookVariables(runtime.toolName, runtime.input);
@@ -329,6 +348,19 @@ export default function (pi: ExtensionAPI) {
 
     // Execute session_start hooks (typically inject actions for context)
     const matched = matchHooks(config.hooks, "session_start");
+
+    // Warn about hooks whose action is not supported on session_start.
+    // Only `inject` fires here; block/warn/exec are silently ignored, so
+    // surface them so the user knows their hook won't fire.
+    const unsupported = matched.filter((h) => h.action !== "inject");
+    if (unsupported.length > 0) {
+      const actions = [...new Set(unsupported.map((h) => h.action))].join(", ");
+      ctx.ui.notify(
+        `hooks-system: ${unsupported.length} session_start hook(s) use unsupported action(s) (${actions}); only "inject" fires on session_start`,
+        "warning",
+      );
+    }
+
     const prompts = matched
       .filter((h) => h.action === "inject" && h.injectPrompt)
       .map((h) => h.injectPrompt!);
@@ -386,6 +418,19 @@ export default function (pi: ExtensionAPI) {
     const config = loadConfigFor(ctx);
 
     const matched = matchHooks(config.hooks, "agent_end");
+
+    // Warn about hooks whose action is not supported on agent_end. Only
+    // `inject` fires here (as a triggerTurn); block/warn/exec are silently
+    // ignored, so surface them.
+    const unsupported = matched.filter((h) => h.action !== "inject");
+    if (unsupported.length > 0) {
+      const actions = [...new Set(unsupported.map((h) => h.action))].join(", ");
+      ctx.ui.notify(
+        `hooks-system: ${unsupported.length} agent_end hook(s) use unsupported action(s) (${actions}); only "inject" fires on agent_end`,
+        "warning",
+      );
+    }
+
     // Merge all matching inject hooks into one message (previously only the
     // first was kept, silently dropping the rest).
     const prompts = matched
