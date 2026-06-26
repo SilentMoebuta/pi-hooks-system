@@ -106,3 +106,75 @@ describe("session_start / agent_end unsupported-action warnings", () => {
     assert.equal(sentMessages.length, 1);
   });
 });
+
+// ── Modify capability end-to-end (subscription layer translation) ──────────
+
+describe("modify capability translation at subscription layer", () => {
+  const tempDirs: string[] = [];
+  after(() => { for (const d of tempDirs) fs.rmSync(d, { recursive: true, force: true }); });
+
+  function makeConfigured(hooks: any[]): { pi: any; ctx: any; handlers: any } {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hooks-mod-"));
+    tempDirs.push(dir);
+    fs.mkdirSync(path.join(dir, ".pi"), { recursive: true });
+    fs.writeFileSync(path.join(dir, ".pi", "hooks.json"), JSON.stringify({ hooks }));
+    const h = makeHarness(dir);
+    // give pi.exec so exec hooks can run, returning a fixed stdout
+    h.pi.exec = async () => ({ code: 0, stdout: (h as any)._execStdout ?? "", stderr: "", killed: false });
+    hooksExtension(h.pi);
+    return h;
+  }
+
+  it("tool_call: patch.input is merged into event.input (mutates args before execution)", async () => {
+    const h = makeConfigured([
+      { event: "tool_call", matcher: { tool: "bash" }, action: "exec", command: "echo x" },
+    ]);
+    (h as any)._execStdout = '{"patch":{"input":{"command":"echo safe"}}}';
+    const event = { toolName: "bash", input: { command: "rm -rf /" } };
+    const ret = await h.handlers["tool_call"]!(event, h.ctx);
+    // input was mutated in place (pi-core contract: mutate event.input)
+    assert.equal((event.input as any).command, "echo safe", "input patched to safe command");
+    assert.equal(ret, undefined, "no block → no return value");
+  });
+
+  it("tool_call: block instruction returns {block:true,reason}", async () => {
+    const h = makeConfigured([
+      { event: "tool_call", matcher: { tool: "bash" }, action: "exec", command: "echo x" },
+    ]);
+    (h as any)._execStdout = '{"block":true,"reason":"dangerous"}';
+    const event = { toolName: "bash", input: { command: "x" } };
+    const ret = await h.handlers["tool_call"]!(event, h.ctx);
+    assert.deepEqual(ret, { block: true, reason: "dangerous" });
+  });
+
+  it("tool_result: replaceResult returns partial patch (omitted fields omitted)", async () => {
+    const h = makeConfigured([
+      { event: "tool_result", matcher: { tool: "bash" }, action: "exec", command: "echo x" },
+    ]);
+    (h as any)._execStdout = '{"replaceResult":{"isError":false}}';
+    const event = { toolName: "bash", input: {}, isError: true, content: [] };
+    const ret = await h.handlers["tool_result"]!(event, h.ctx);
+    assert.deepEqual(ret, { isError: false }, "partial patch: only isError returned");
+  });
+
+  it("message_end: replaceMessage returns {message}", async () => {
+    const h = makeConfigured([
+      { event: "message_end", action: "exec", command: "echo x" },
+    ]);
+    (h as any)._execStdout = '{"replaceMessage":{"message":{"role":"assistant","content":"redacted"}}}';
+    const ret = await h.handlers["message_end"]!({}, h.ctx);
+    assert.deepEqual(ret, { message: { role: "assistant", content: "redacted" } });
+  });
+
+  it("legacy CC name pre_tool_use config still fires on tool_call subscription (dual-name)", async () => {
+    // old config uses pre_tool_use; subscription arrives as tool_call. Both
+    // normalize to tool_call → hook fires.
+    const h = makeConfigured([
+      { event: "pre_tool_use", matcher: { tool: "bash" }, action: "exec", command: "echo x" },
+    ]);
+    (h as any)._execStdout = '{"block":true,"reason":"legacy"}';
+    const event = { toolName: "bash", input: { command: "x" } };
+    const ret = await h.handlers["tool_call"]!(event, h.ctx);
+    assert.deepEqual(ret, { block: true, reason: "legacy" });
+  });
+});

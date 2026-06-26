@@ -5,6 +5,34 @@ import type { HookDefinition } from "../index";
 
 // ── Tests ───────────────────────────────────────────────────────────────────
 
+describe("matchHooks dual-name compatibility (CC ↔ pi-native)", () => {
+  it("matches a hook configured with pi-native event name when called with the pi name", () => {
+    const hooks: HookDefinition[] = [
+      { event: "tool_call" as HookDefinition["event"], action: "block" },
+    ];
+    const result = matchHooks(hooks, "tool_call", "bash", { command: "ls" });
+    assert.strictEqual(result.length, 1);
+  });
+
+  it("matches a legacy CC-configured hook (pre_tool_use) when subscribed via pi name (tool_call)", () => {
+    // dual-name compat: old configs using pre_tool_use still fire when the
+    // subscription arrives as the pi-native tool_call event.
+    const hooks: HookDefinition[] = [
+      { event: "pre_tool_use", action: "block" },
+    ];
+    const result = matchHooks(hooks, "tool_call", "bash", { command: "ls" });
+    assert.strictEqual(result.length, 1);
+  });
+
+  it("matches a pi-configured hook (tool_call) when subscribed via legacy CC name (pre_tool_use)", () => {
+    const hooks: HookDefinition[] = [
+      { event: "tool_call" as HookDefinition["event"], action: "block" },
+    ];
+    const result = matchHooks(hooks, "pre_tool_use", "bash", { command: "ls" });
+    assert.strictEqual(result.length, 1);
+  });
+});
+
 describe("matchHooks", () => {
   // 1. Empty hooks array returns empty
   it("returns empty array when hooks array is empty", () => {

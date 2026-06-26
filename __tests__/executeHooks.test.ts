@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { executeHooks } from "../index";
+import { executeHooks, mergeModifyInstruction } from "../index";
 import type { HookDefinition } from "../index";
 
 // ── Minimal fakes ───────────────────────────────────────────────────────────
@@ -8,6 +8,8 @@ import type { HookDefinition } from "../index";
 interface FakeOpts {
   trusted?: boolean;
   hasUI?: boolean;
+  /** stdout returned by the fake pi.exec (default "" = no instruction). */
+  execStdout?: string;
 }
 
 function makeFakes(opts: FakeOpts = {}) {
@@ -18,7 +20,7 @@ function makeFakes(opts: FakeOpts = {}) {
   const pi: any = {
     exec: async (cmd: string, args: string[]) => {
       execCalls.push({ cmd, args });
-      return { code: 0, stdout: "", stderr: "", killed: false };
+      return { code: 0, stdout: opts.execStdout ?? "", stderr: "", killed: false };
     },
     sendMessage: () => {},
   };
@@ -105,5 +107,82 @@ describe("executeHooks block notifies regardless of hasUI", () => {
       notifies.some((n) => /Blocked by hooks-system/.test(n.msg)),
       `expected generic block notify, got: ${JSON.stringify(notifies)}`,
     );
+  });
+});
+
+// ── Modify instruction collection (exec stdout → modifyInstruction) ────────
+
+describe("executeHooks modify instruction collection", () => {
+  const patchHook: HookDefinition = {
+    event: "tool_call" as any,
+    action: "exec",
+    command: "echo '{\"patch\":{\"input\":{\"command\":\"echo safe\"}}}'",
+  };
+
+  it("collects a patch.input instruction from exec stdout on tool_call", async () => {
+    const { pi, ctx } = makeFakes({ execStdout: '{"patch":{"input":{"command":"echo safe"}}}' });
+    const res = await executeHooks([patchHook], pi, ctx, { toolName: "bash", input: { command: "rm -rf /" } });
+    assert.deepEqual(res.modifyInstruction, { patch: { input: { command: "echo safe" } } });
+  });
+
+  it("collects a block instruction from exec stdout", async () => {
+    const hook: HookDefinition = { event: "tool_call" as any, action: "exec", command: "echo x" };
+    const { pi, ctx } = makeFakes({ execStdout: '{"block":true,"reason":"dangerous"}' });
+    const res = await executeHooks([hook], pi, ctx, { toolName: "bash" });
+    assert.deepEqual(res.modifyInstruction, { block: true, reason: "dangerous" });
+  });
+
+  it("collects a replaceResult instruction from exec stdout (tool_result)", async () => {
+    const hook: HookDefinition = { event: "tool_result" as any, action: "exec", command: "echo x" };
+    const { pi, ctx } = makeFakes({ execStdout: '{"replaceResult":{"isError":false}}' });
+    const res = await executeHooks([hook], pi, ctx, { toolName: "bash" });
+    assert.deepEqual(res.modifyInstruction, { replaceResult: { isError: false } });
+  });
+
+  it("collects a replaceMessage instruction from exec stdout (message_end)", async () => {
+    const hook: HookDefinition = { event: "message_end" as any, action: "exec", command: "echo x" };
+    const { pi, ctx } = makeFakes({ execStdout: '{"replaceMessage":{"message":{"role":"assistant","content":"x"}}}' });
+    const res = await executeHooks([hook], pi, ctx, {});
+    assert.deepEqual(res.modifyInstruction, { replaceMessage: { message: { role: "assistant", content: "x" } } });
+  });
+
+  it("returns null modifyInstruction when exec stdout is plain text (back-compat)", async () => {
+    const hook: HookDefinition = { event: "tool_call" as any, action: "exec", command: "echo x" };
+    const { pi, ctx } = makeFakes({ execStdout: "just a log line" });
+    const res = await executeHooks([hook], pi, ctx, { toolName: "bash" });
+    assert.equal(res.modifyInstruction, null);
+  });
+
+  it("returns null modifyInstruction when no exec hook matched", async () => {
+    const hook: HookDefinition = { event: "tool_call" as any, action: "warn", message: "hi" };
+    const { pi, ctx } = makeFakes();
+    const res = await executeHooks([hook], pi, ctx, { toolName: "bash" });
+    assert.equal(res.modifyInstruction, null);
+  });
+});
+
+// ── mergeModifyInstruction (pure) ───────────────────────────────────────────
+
+describe("mergeModifyInstruction", () => {
+  it("returns next as-is when acc is null", () => {
+    assert.deepEqual(mergeModifyInstruction(null, { block: true, reason: "x" }), { block: true, reason: "x" });
+  });
+
+  it("shallow-merges patch.input (later wins on conflict)", () => {
+    const acc = { patch: { input: { a: 1, b: 2 } } };
+    const next = { patch: { input: { b: 99, c: 3 } } };
+    assert.deepEqual(mergeModifyInstruction(acc, next), { patch: { input: { a: 1, b: 99, c: 3 } } });
+  });
+
+  it("block is OR-ed; reason keeps first set", () => {
+    const acc = { block: true, reason: "first" };
+    const next = { block: true };
+    assert.deepEqual(mergeModifyInstruction(acc, next), { block: true, reason: "first" });
+  });
+
+  it("replaceMessage is last-wins", () => {
+    const acc = { replaceMessage: { message: { v: 1 } } };
+    const next = { replaceMessage: { message: { v: 2 } } };
+    assert.deepEqual(mergeModifyInstruction(acc, next), { replaceMessage: { message: { v: 2 } } });
   });
 });

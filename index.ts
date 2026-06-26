@@ -4,8 +4,9 @@
  * Configuration-driven hooks framework for Pi Agent.
  * Users configure hooks in .pi/hooks.json instead of writing TypeScript code.
  *
- * Supported events: pre_tool_use, post_tool_use, agent_end, session_start
- * Supported actions: block, warn, inject, exec
+ * Events: full pi-core event list (pi-native names), with legacy CC names
+ * (pre_tool_use/post_tool_use) kept as deprecated aliases for compatibility.
+ * Supported actions: block, warn, inject, exec, patch (modify tool input/result/message)
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -14,6 +15,123 @@ import * as path from "node:path";
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
+/** pi-native event names forwarded by hooks-system. Mirrors pi-core's
+ *  ExtensionAPI event surface (docs/extensions.md), excluding discovery /
+ *  internal-state events (project_trust, resources_discover, context) that
+ *  are unsuitable for external shell hooks. */
+export type PiHookEvent =
+  // lifecycle
+  | "session_start" | "session_shutdown" | "session_before_switch" | "session_before_fork"
+  | "session_before_compact" | "session_compact" | "session_before_tree" | "session_tree"
+  // agent / turn
+  | "before_agent_start" | "agent_start" | "agent_end" | "turn_start" | "turn_end"
+  // message
+  | "message_start" | "message_update" | "message_end"
+  // tool
+  | "tool_call" | "tool_result" | "tool_execution_start" | "tool_execution_update" | "tool_execution_end"
+  // provider
+  | "before_provider_request" | "after_provider_response" | "model_select" | "thinking_level_select"
+  // user input
+  | "user_bash" | "input";
+
+/** Full list of pi-native events hooks-system forwards. Used to register
+ *  pi.on(...) handlers exhaustively and to validate config event names. */
+export const PI_HOOK_EVENTS: readonly PiHookEvent[] = [
+  "session_start", "session_shutdown", "session_before_switch", "session_before_fork",
+  "session_before_compact", "session_compact", "session_before_tree", "session_tree",
+  "before_agent_start", "agent_start", "agent_end", "turn_start", "turn_end",
+  "message_start", "message_update", "message_end",
+  "tool_call", "tool_result", "tool_execution_start", "tool_execution_update", "tool_execution_end",
+  "before_provider_request", "after_provider_response", "model_select", "thinking_level_select",
+  "user_bash", "input",
+];
+
+/** Legacy Claude-Code-style event names → pi-native names. Only the RENAMED
+ *  ones are deprecated aliases; agent_end/session_start kept their names so
+ *  they are not "legacy" (no migration needed). */
+export const CC_TO_PI_EVENT: Record<string, PiHookEvent> = {
+  pre_tool_use: "tool_call",
+  post_tool_use: "tool_result",
+  agent_end: "agent_end",
+  session_start: "session_start",
+};
+
+/** CC event names that were RENAMED (not same-named) → deprecated aliases.
+ *  Configs using these get a deprecation warning but still work. */
+export const DEPRECATED_CC_EVENTS = new Set(["pre_tool_use", "post_tool_use"]);
+
+/** Normalize a user-configured event name to its pi-native form. Accepts both
+ *  pi-native names (passthrough) and legacy CC names (mapped). */
+export function normalizeEvent(event: string): PiHookEvent {
+  return (CC_TO_PI_EVENT[event] ?? event) as PiHookEvent;
+}
+
+// ── Modify instructions (hook stdout → pi-core mutation contract) ────────────
+
+/** A modify instruction emitted by an exec hook via stdout JSON. Each field
+ *  applies on a specific event and is translated by hooks-system into the
+ *  corresponding pi-core in-process contract:
+ *  - patch.input  (tool_call only)  → mutate event.input before execution
+ *  - block         (tool_call only)  → return { block: true, reason }
+ *  - replaceResult (tool_result only) → return partial patch { content?, details?, isError? }
+ *  - replaceMessage(message_end only) → return { message } */
+export interface HookModifyInstruction {
+  patch?: { input?: Record<string, unknown> };
+  block?: boolean;
+  reason?: string;
+  replaceResult?: { content?: unknown[]; details?: unknown; isError?: boolean };
+  replaceMessage?: { message: unknown };
+}
+
+/** Merge a newly-collected modify instruction into an accumulated one.
+ *  Semantics: patch.input and replaceResult shallow-merge (later wins on
+ *  conflicting keys); block is OR (any hook blocks); reason keeps first set;
+ *  replaceMessage is last-wins. Pure, unit-testable. */
+export function mergeModifyInstruction(
+  acc: HookModifyInstruction | null,
+  next: HookModifyInstruction,
+): HookModifyInstruction {
+  if (!acc) return { ...next };
+  const merged: HookModifyInstruction = { ...acc };
+  if (next.patch?.input) {
+    merged.patch = { input: { ...(acc.patch?.input ?? {}), ...next.patch.input } };
+  }
+  if (next.block) {
+    merged.block = true;
+    merged.reason = acc.reason ?? next.reason;
+  }
+  if (next.replaceResult) {
+    merged.replaceResult = { ...(acc.replaceResult ?? {}), ...next.replaceResult };
+  }
+  if (next.replaceMessage) {
+    merged.replaceMessage = next.replaceMessage;
+  }
+  return merged;
+}
+
+/** Parse hook exec stdout into a modify instruction. Returns null when stdout
+ *  is not a JSON modify instruction (non-JSON, or JSON without a recognized
+ *  modify field) — in that case callers treat stdout as plain inject text,
+ *  preserving back-compat with existing exec hooks that print free text. */
+export function parseModifyInstruction(stdout: string): HookModifyInstruction | null {
+  const trimmed = stdout.trim();
+  if (!trimmed.startsWith("{")) return null;
+  let obj: unknown;
+  try {
+    obj = JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+  if (typeof obj !== "object" || obj === null) return null;
+  const o = obj as Record<string, unknown>;
+  const isInstruction =
+    "patch" in o || "block" in o || "replaceResult" in o || "replaceMessage" in o;
+  if (!isInstruction) return null;
+  return o as unknown as HookModifyInstruction;
+}
+
+/** Back-compat: HookEvent still accepts legacy CC names. New code should use
+ *  PiHookEvent + normalizeEvent. */
 export type HookEvent = "pre_tool_use" | "post_tool_use" | "agent_end" | "session_start";
 
 export interface HookMatcher {
@@ -95,17 +213,23 @@ export interface HookMatchResult {
 /**
  * Filter hooks that match the given event and optional tool name/input/result.
  * A hook must match both the event AND the optional matcher (if present).
+ *
+ * Dual-name compatible: both the requested `event` and each hook's configured
+ * `event` are normalized via normalizeEvent before comparing, so a legacy
+ * CC-configured hook (event: "pre_tool_use") matches a pi-native subscription
+ * ("tool_call") and vice versa.
  */
 export function matchHooks(
   hooks: HookDefinition[],
-  event: HookEvent,
+  event: string,
   toolName?: string,
   input?: Record<string, unknown>,
   result?: HookMatchResult,
 ): HookDefinition[] {
   const inputStr = JSON.stringify(input ?? {});
+  const normEvent = normalizeEvent(event);
   return hooks.filter((h) => {
-    if (h.event !== event) return false;
+    if (normalizeEvent(h.event) !== normEvent) return false;
 
     const matcher = h.matcher;
     if (matcher) {
@@ -140,6 +264,10 @@ interface HookExecutionResult {
   blocked: boolean;
   /** Messages to inject into agent context */
   injectMessages: string[];
+  /** Modify instruction collected from exec hook stdout (input patch / block /
+   *  result replace / message replace). Translated by the subscriber into the
+   *  pi-core in-process mutation contract. Null when no exec hook emitted one. */
+  modifyInstruction: HookModifyInstruction | null;
 }
 
 interface HookRuntimeContext {
@@ -190,6 +318,7 @@ export async function executeHooks(
 ): Promise<HookExecutionResult> {
   let blocked = false;
   const injectMessages: string[] = [];
+  let modifyInstruction: HookModifyInstruction | null = null;
 
   for (const hook of matched) {
     switch (hook.action) {
@@ -277,6 +406,15 @@ export async function executeHooks(
               } else {
                 injectMessages.push(failureOutput);
               }
+            } else {
+              // exec succeeded: parse stdout for a modify instruction (input
+              // patch / block / result replace / message replace). Non-JSON or
+              // JSON without a modify field → null (back-compat: stdout ignored,
+              // matching prior behavior of successful exec hooks).
+              const instr = parseModifyInstruction(result.stdout);
+              if (instr) {
+                modifyInstruction = mergeModifyInstruction(modifyInstruction, instr);
+              }
             }
           } catch (err: unknown) {
             const errMsg = err instanceof Error ? err.message : String(err);
@@ -288,7 +426,7 @@ export async function executeHooks(
     }
   }
 
-  return { blocked, injectMessages };
+  return { blocked, injectMessages, modifyInstruction };
 }
 
 // ── Message injection helpers ───────────────────────────────────────────────
@@ -379,19 +517,29 @@ export default function (pi: ExtensionAPI) {
     // Cast to Record<string, unknown> for generic pattern matching.
     const input = (event as unknown as { input: Record<string, unknown> }).input;
 
-    const matched = matchHooks(config.hooks, "pre_tool_use", toolName, input);
-    const { blocked, injectMessages } = await executeHooks(matched, pi, ctx, { toolName, input });
+    // Subscribe via pi-native name "tool_call"; matchHooks normalizes both
+    // sides, so legacy CC configs (event: "pre_tool_use") still match.
+    const matched = matchHooks(config.hooks, "tool_call", toolName, input);
+    const { blocked, injectMessages, modifyInstruction } = await executeHooks(matched, pi, ctx, { toolName, input });
 
     // Inject any messages collected during hook execution
     injectSteerMessages(pi, injectMessages, "hooks-system");
 
-    if (blocked) {
-      const reason = matched
-        .filter((h) => h.action === "block")
-        .map((h) => h.message)
-        .filter(Boolean)
-        .join("; ");
-      return { block: true, reason: reason || "Blocked by hooks-system pre_tool_use hook" };
+    // Translate modify instruction → pi-core tool_call contract:
+    //   patch.input  → mutate event.input in place (affects execution)
+    //   block        → return { block: true, reason }
+    if (modifyInstruction?.patch?.input) {
+      Object.assign(input, modifyInstruction.patch.input);
+    }
+    if (blocked || modifyInstruction?.block) {
+      const reason =
+        modifyInstruction?.reason ||
+        matched
+          .filter((h) => h.action === "block")
+          .map((h) => h.message)
+          .filter(Boolean)
+          .join("; ");
+      return { block: true, reason: reason || "Blocked by hooks-system tool_call hook" };
     }
   });
 
@@ -403,13 +551,42 @@ export default function (pi: ExtensionAPI) {
     const toolName = event.toolName;
     const input = event.input;
 
-    const matched = matchHooks(config.hooks, "post_tool_use", toolName, input, {
+    // Subscribe via pi-native name "tool_result"; matchHooks normalizes both
+    // sides, so legacy CC configs (event: "post_tool_use") still match.
+    const matched = matchHooks(config.hooks, "tool_result", toolName, input, {
       isError: event.isError,
     });
-    const { injectMessages } = await executeHooks(matched, pi, ctx, { toolName, input });
+    const { injectMessages, modifyInstruction } = await executeHooks(matched, pi, ctx, { toolName, input });
 
     // Inject feedback messages (e.g., exec failures with onFailure: "inject")
     injectSteerMessages(pi, injectMessages, "hooks-system-feedback");
+
+    // Translate modify instruction → pi-core tool_result contract:
+    //   replaceResult → return partial patch { content?, details?, isError? }.
+    //   Omitted fields keep their current values (pi-core merges the patch).
+    if (modifyInstruction?.replaceResult) {
+      const patch: Record<string, unknown> = {};
+      const r = modifyInstruction.replaceResult;
+      if (r.content !== undefined) patch.content = r.content;
+      if (r.details !== undefined) patch.details = r.details;
+      if (r.isError !== undefined) patch.isError = r.isError;
+      return patch;
+    }
+  });
+
+  // ── message_end: Process message_end hooks (can replace finalized message) ─
+
+  pi.on("message_end", async (_event, ctx) => {
+    const config = loadConfigFor(ctx);
+
+    const matched = matchHooks(config.hooks, "message_end");
+    const { modifyInstruction } = await executeHooks(matched, pi, ctx, {});
+
+    // Translate modify instruction → pi-core message_end contract:
+    //   replaceMessage → return { message } (replacement must keep same role).
+    if (modifyInstruction?.replaceMessage) {
+      return { message: modifyInstruction.replaceMessage.message };
+    }
   });
 
   // ── agent_end: Process agent_end hooks (formerly documented as stop_request) ─
@@ -441,4 +618,34 @@ export default function (pi: ExtensionAPI) {
       injectTriggerTurn(pi, "hooks-stop-check", prompts.join("\n\n"));
     }
   });
+
+  // ── Generic forwarding for the remaining pi-core events ───────────────────
+  // These events have no pi-core mutation contract (only tool_call/tool_result/
+  // message_end can modify), so hooks on them are notification-only: exec runs
+  // a side-effect command, warn notifies, inject steers. block is unsupported
+  // (pi-core cannot block a lifecycle/turn/provider event) → warned + ignored.
+  const SPECIAL_EVENTS = new Set([
+    "session_start", "tool_call", "tool_result", "message_end", "agent_end",
+  ]);
+  for (const evt of PI_HOOK_EVENTS) {
+    if (SPECIAL_EVENTS.has(evt)) continue; // handled above with custom contracts
+    pi.on(evt, async (_event, ctx) => {
+      const config = loadConfigFor(ctx);
+      const matched = matchHooks(config.hooks, evt);
+      if (matched.length === 0) return;
+
+      // Warn about unsupported actions on notification-only events. block has
+      // no effect (pi-core cannot block these); exec/warn/inject are honored.
+      const unsupported = matched.filter((h) => h.action === "block");
+      if (unsupported.length > 0) {
+        ctx.ui.notify(
+          `hooks-system: ${unsupported.length} ${evt} hook(s) use "block" which is unsupported on this event (notification-only); ignored`,
+          "warning",
+        );
+      }
+
+      const { injectMessages } = await executeHooks(matched, pi, ctx, {});
+      injectSteerMessages(pi, injectMessages, `hooks-${evt}`);
+    });
+  }
 }
